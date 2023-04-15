@@ -545,7 +545,7 @@ func (b *EthereumRPC) getBlockRaw(hash string, height uint32, fullTxs bool) (jso
 	}
 	if err != nil {
 		return nil, errors.Annotatef(err, "hash %v, height %v", hash, height)
-	} else if len(raw) == 0 {
+	} else if len(raw) == 0 || (len(raw) == 4 && string(raw) == "null") {
 		return nil, bchain.ErrBlockNotFound
 	}
 	return raw, nil
@@ -620,6 +620,9 @@ func (b *EthereumRPC) processCallTrace(call *rpcCallTrace, d *bchain.EthereumInt
 			To:    call.To,
 		})
 		contracts = append(contracts, bchain.ContractInfo{Contract: call.From, DestructedInBlock: blockHeight})
+	} else if call.Type == "DELEGATECALL" {
+		// ignore DELEGATECALL (geth v1.11 the changed tracer behavior)
+		// 	https://github.com/ethereum/go-ethereum/issues/26726
 	} else if err == nil && (value.BitLen() > 0 || b.ChainConfig.ProcessZeroInternalTransactions) {
 		d.Transfers = append(d.Transfers, bchain.EthereumInternalTransfer{
 			Value: *value,

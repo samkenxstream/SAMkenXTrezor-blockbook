@@ -158,7 +158,7 @@ type MultiTokenValue struct {
 
 // Token contains info about tokens held by an address
 type Token struct {
-	Type             bchain.TokenTypeName `json:"type"`
+	Type             bchain.TokenTypeName `json:"type" ts_type:"'XPUBAddress' | 'ERC20' | 'ERC721' | 'ERC1155'"`
 	Name             string               `json:"name"`
 	Path             string               `json:"path,omitempty"`
 	Contract         string               `json:"contract,omitempty"`
@@ -230,7 +230,7 @@ type EthereumSpecific struct {
 	Error             string                                 `json:"error,omitempty"`
 	Nonce             uint64                                 `json:"nonce"`
 	GasLimit          *big.Int                               `json:"gasLimit"`
-	GasUsed           *big.Int                               `json:"gasUsed"`
+	GasUsed           *big.Int                               `json:"gasUsed,omitempty"`
 	GasPrice          *Amount                                `json:"gasPrice"`
 	Data              string                                 `json:"data,omitempty"`
 	ParsedData        *bchain.EthereumParsedInputData        `json:"parsedData,omitempty"`
@@ -263,7 +263,7 @@ type Tx struct {
 	FeesSat                *Amount           `json:"fees,omitempty"`
 	Hex                    string            `json:"hex,omitempty"`
 	Rbf                    bool              `json:"rbf,omitempty"`
-	CoinSpecificData       json.RawMessage   `json:"coinSpecificData,omitempty"`
+	CoinSpecificData       json.RawMessage   `json:"coinSpecificData,omitempty" ts_type:"any"`
 	TokenTransfers         []TokenTransfer   `json:"tokenTransfers,omitempty"`
 	EthereumSpecific       *EthereumSpecific `json:"ethereumSpecific,omitempty"`
 	AddressAliases         AddressAliasesMap `json:"addressAliases,omitempty"`
@@ -339,6 +339,7 @@ type Address struct {
 	TotalBaseValue        float64              `json:"totalBaseValue,omitempty"`      // value including tokens in base currency
 	TotalSecondaryValue   float64              `json:"totalSecondaryValue,omitempty"` // value including tokens in secondary currency
 	ContractInfo          *bchain.ContractInfo `json:"contractInfo,omitempty"`
+	Erc20Contract         *bchain.ContractInfo `json:"erc20Contract,omitempty"` // deprecated
 	AddressAliases        AddressAliasesMap    `json:"addressAliases,omitempty"`
 	// helpers for explorer
 	Filter        string              `json:"-"`

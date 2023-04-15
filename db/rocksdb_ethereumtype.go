@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"math/big"
+	"os"
+	"sort"
 	"sync"
 
 	vlq "github.com/bsm/go-vlq"
@@ -17,14 +19,101 @@ import (
 const InternalTxIndexOffset = 1
 const ContractIndexOffset = 2
 
+type AggregateFn = func(*big.Int, *big.Int)
+
+type Ids []big.Int
+
+func (s *Ids) sort() bool {
+	sorted := false
+	sort.Slice(*s, func(i, j int) bool {
+		isLess := (*s)[i].CmpAbs(&(*s)[j]) == -1
+		if isLess == (i > j) { // it is necessary to swap - (id[i]<id[j] and i>j) or (id[i]>id[j] and i<j)
+			sorted = true
+		}
+		return isLess
+	})
+	return sorted
+}
+
+func (s *Ids) search(id big.Int) int {
+	// attempt to find id using a binary search
+	return sort.Search(len(*s), func(i int) bool {
+		return (*s)[i].CmpAbs(&id) >= 0
+	})
+}
+
+// insert id in ascending order
+func (s *Ids) insert(id big.Int) {
+	i := s.search(id)
+	if i == len(*s) {
+		*s = append(*s, id)
+	} else {
+		*s = append((*s)[:i+1], (*s)[i:]...)
+		(*s)[i] = id
+	}
+}
+
+func (s *Ids) remove(id big.Int) {
+	i := s.search(id)
+	// remove id if found
+	if i < len(*s) && (*s)[i].CmpAbs(&id) == 0 {
+		*s = append((*s)[:i], (*s)[i+1:]...)
+	}
+}
+
+type MultiTokenValues []bchain.MultiTokenValue
+
+func (s *MultiTokenValues) sort() bool {
+	sorted := false
+	sort.Slice(*s, func(i, j int) bool {
+		isLess := (*s)[i].Id.CmpAbs(&(*s)[j].Id) == -1
+		if isLess == (i > j) { // it is necessary to swap - (id[i]<id[j] and i>j) or (id[i]>id[j] and i<j)
+			sorted = true
+		}
+		return isLess
+	})
+	return sorted
+}
+
+// search for multi token value using a binary seach on id
+func (s *MultiTokenValues) search(m bchain.MultiTokenValue) int {
+	return sort.Search(len(*s), func(i int) bool {
+		return (*s)[i].Id.CmpAbs(&m.Id) >= 0
+	})
+}
+
+func (s *MultiTokenValues) upsert(m bchain.MultiTokenValue, index int32, aggregate AggregateFn) {
+	i := s.search(m)
+	if i < len(*s) && (*s)[i].Id.CmpAbs(&m.Id) == 0 {
+		aggregate(&(*s)[i].Value, &m.Value)
+		// if transfer from, remove if the value is zero
+		if index < 0 && len((*s)[i].Value.Bits()) == 0 {
+			*s = append((*s)[:i], (*s)[i+1:]...)
+		}
+		return
+	}
+	if index >= 0 {
+		elem := bchain.MultiTokenValue{
+			Id:    m.Id,
+			Value: *new(big.Int).Set(&m.Value),
+		}
+		if i == len(*s) {
+			*s = append(*s, elem)
+		} else {
+			*s = append((*s)[:i+1], (*s)[i:]...)
+			(*s)[i] = elem
+		}
+	}
+}
+
 // AddrContract is Contract address with number of transactions done by given address
 type AddrContract struct {
 	Type             bchain.TokenType
 	Contract         bchain.AddressDescriptor
 	Txs              uint
-	Value            big.Int                  // single value of ERC20
-	Ids              []big.Int                // multiple ERC721 tokens
-	MultiTokenValues []bchain.MultiTokenValue // multiple ERC1155 tokens
+	Value            big.Int          // single value of ERC20
+	Ids              Ids              // multiple ERC721 tokens
+	MultiTokenValues MultiTokenValues // multiple ERC1155 tokens
 }
 
 // AddrContracts contains number of transactions and contracts for an address
@@ -103,14 +192,14 @@ func unpackAddrContracts(buf []byte, addrDesc bchain.AddressDescriptor) (*AddrCo
 			len, ll := unpackVaruint(buf)
 			buf = buf[ll:]
 			if ttt == bchain.NonFungibleToken {
-				ac.Ids = make([]big.Int, len)
+				ac.Ids = make(Ids, len)
 				for i := uint(0); i < len; i++ {
 					b, ll := unpackBigint(buf)
 					buf = buf[ll:]
 					ac.Ids[i] = b
 				}
 			} else {
-				ac.MultiTokenValues = make([]bchain.MultiTokenValue, len)
+				ac.MultiTokenValues = make(MultiTokenValues, len)
 				for i := uint(0); i < len; i++ {
 					b, ll := unpackBigint(buf)
 					buf = buf[ll:]
@@ -210,7 +299,7 @@ func addToAddressesMapEthereumType(addresses addressesMap, strAddrDesc string, b
 }
 
 func addToContract(c *AddrContract, contractIndex int, index int32, contract bchain.AddressDescriptor, transfer *bchain.TokenTransfer, addTxCount bool) int32 {
-	var aggregate func(*big.Int, *big.Int)
+	var aggregate AggregateFn
 	// index 0 is for ETH transfers, index 1 (InternalTxIndexOffset) is for internal transfers, contract indexes start with 2 (ContractIndexOffset)
 	if index < 0 {
 		index = ^int32(contractIndex + ContractIndexOffset)
@@ -231,39 +320,13 @@ func addToContract(c *AddrContract, contractIndex int, index int32, contract bch
 		aggregate(&c.Value, &transfer.Value)
 	} else if transfer.Type == bchain.NonFungibleToken {
 		if index < 0 {
-			// remove token from the list
-			for i := range c.Ids {
-				if c.Ids[i].Cmp(&transfer.Value) == 0 {
-					c.Ids = append(c.Ids[:i], c.Ids[i+1:]...)
-					break
-				}
-			}
+			c.Ids.remove(transfer.Value)
 		} else {
-			// add token to the list
-			c.Ids = append(c.Ids, transfer.Value)
+			c.Ids.insert(transfer.Value)
 		}
 	} else { // bchain.ERC1155
 		for _, t := range transfer.MultiTokenValues {
-			for i := range c.MultiTokenValues {
-				// find the token in the list
-				if c.MultiTokenValues[i].Id.Cmp(&t.Id) == 0 {
-					aggregate(&c.MultiTokenValues[i].Value, &t.Value)
-					// if transfer from, remove if the value is zero
-					if index < 0 && len(c.MultiTokenValues[i].Value.Bits()) == 0 {
-						c.MultiTokenValues = append(c.MultiTokenValues[:i], c.MultiTokenValues[i+1:]...)
-					}
-					goto nextTransfer
-				}
-			}
-			// if not found and transfer to, add to the list
-			// it is necessary to add a copy of the value so that subsequent calls to addToContract do not change the transfer value
-			if index >= 0 {
-				c.MultiTokenValues = append(c.MultiTokenValues, bchain.MultiTokenValue{
-					Id:    t.Id,
-					Value: *new(big.Int).Set(&t.Value),
-				})
-			}
-		nextTransfer:
+			c.MultiTokenValues.upsert(t, index, aggregate)
 		}
 	}
 	if addTxCount {
@@ -388,7 +451,23 @@ func (d *RocksDB) processBaseTxData(blockTx *ethBlockTx, tx *bchain.Tx, addresse
 	return nil
 }
 
-func (d *RocksDB) processInternalData(blockTx *ethBlockTx, tx *bchain.Tx, id *bchain.EthereumInternalData, addresses addressesMap, addressContracts map[string]*AddrContracts) error {
+func (d *RocksDB) setAddressTxIndexesToAddressMap(addrDesc bchain.AddressDescriptor, height uint32, addresses addressesMap) error {
+	strAddrDesc := string(addrDesc)
+	_, found := addresses[strAddrDesc]
+	if !found {
+		txIndexes, err := d.getTxIndexesForAddressAndBlock(addrDesc, height)
+		if err != nil {
+			return err
+		}
+		if len(txIndexes) > 0 {
+			addresses[strAddrDesc] = txIndexes
+		}
+	}
+	return nil
+}
+
+// existingBlock signals that internal data are reconnected to already indexed block after they failed during standard sync
+func (d *RocksDB) processInternalData(blockTx *ethBlockTx, tx *bchain.Tx, id *bchain.EthereumInternalData, addresses addressesMap, addressContracts map[string]*AddrContracts, existingBlock bool) error {
 	blockTx.internalData = &ethInternalData{
 		internalType: id.Type,
 		errorMsg:     id.Error,
@@ -404,6 +483,11 @@ func (d *RocksDB) processInternalData(blockTx *ethBlockTx, tx *bchain.Tx, id *bc
 			blockTx.internalData.internalType = bchain.CALL
 		} else {
 			blockTx.internalData.contract = to
+			if existingBlock {
+				if err = d.setAddressTxIndexesToAddressMap(to, tx.BlockHeight, addresses); err != nil {
+					return err
+				}
+			}
 			if err = d.addToAddressesAndContractsEthereumType(to, blockTx.btxID, internalTransferTo, nil, nil, true, addresses, addressContracts); err != nil {
 				return err
 			}
@@ -422,6 +506,11 @@ func (d *RocksDB) processInternalData(blockTx *ethBlockTx, tx *bchain.Tx, id *bc
 					glog.Warningf("rocksdb: processInternalData: %v, tx %v, internal transfer %d to", err, tx.Txid, i)
 				}
 			} else {
+				if existingBlock {
+					if err = d.setAddressTxIndexesToAddressMap(to, tx.BlockHeight, addresses); err != nil {
+						return err
+					}
+				}
 				if err = d.addToAddressesAndContractsEthereumType(to, blockTx.btxID, internalTransferTo, nil, nil, true, addresses, addressContracts); err != nil {
 					return err
 				}
@@ -433,6 +522,11 @@ func (d *RocksDB) processInternalData(blockTx *ethBlockTx, tx *bchain.Tx, id *bc
 					glog.Warningf("rocksdb: processInternalData: %v, tx %v, internal transfer %d from", err, tx.Txid, i)
 				}
 			} else {
+				if existingBlock {
+					if err = d.setAddressTxIndexesToAddressMap(from, tx.BlockHeight, addresses); err != nil {
+						return err
+					}
+				}
 				if err = d.addToAddressesAndContractsEthereumType(from, blockTx.btxID, internalTransferFrom, nil, nil, !bytes.Equal(from, to), addresses, addressContracts); err != nil {
 					return err
 				}
@@ -498,7 +592,7 @@ func (d *RocksDB) processAddressesEthereumType(block *bchain.Block, addresses ad
 		// process internal data
 		eid, _ := tx.CoinSpecificData.(bchain.EthereumSpecificData)
 		if eid.InternalData != nil {
-			if err = d.processInternalData(blockTx, tx, eid.InternalData, addresses, addressContracts); err != nil {
+			if err = d.processInternalData(blockTx, tx, eid.InternalData, addresses, addressContracts, false); err != nil {
 				return nil, err
 			}
 		}
@@ -508,6 +602,53 @@ func (d *RocksDB) processAddressesEthereumType(block *bchain.Block, addresses ad
 		}
 	}
 	return blockTxs, nil
+}
+
+// ReconnectInternalDataToBlockEthereumType adds missing internal data to the block and stores them in db
+func (d *RocksDB) ReconnectInternalDataToBlockEthereumType(block *bchain.Block) error {
+	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	if d.chainParser.GetChainType() != bchain.ChainEthereumType {
+		return errors.New("Unsupported chain type")
+	}
+
+	addresses := make(addressesMap)
+	addressContracts := make(map[string]*AddrContracts)
+
+	// process internal data
+	blockTxs := make([]ethBlockTx, len(block.Txs))
+	for txi := range block.Txs {
+		tx := &block.Txs[txi]
+		eid, _ := tx.CoinSpecificData.(bchain.EthereumSpecificData)
+		if eid.InternalData != nil {
+			btxID, err := d.chainParser.PackTxid(tx.Txid)
+			if err != nil {
+				return err
+			}
+			blockTx := &blockTxs[txi]
+			blockTx.btxID = btxID
+			tx.BlockHeight = block.Height
+			if err = d.processInternalData(blockTx, tx, eid.InternalData, addresses, addressContracts, true); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := d.storeAddressContracts(wb, addressContracts); err != nil {
+		return err
+	}
+	if err := d.storeInternalDataEthereumType(wb, blockTxs); err != nil {
+		return err
+	}
+	if err := d.storeAddresses(wb, block.Height, addresses); err != nil {
+		return err
+	}
+	// remove the block from the internal errors table
+	wb.DeleteCF(d.cfh[cfBlockInternalDataErrors], packUint(block.Height))
+	if err := d.WriteBatch(wb); err != nil {
+		return err
+	}
+	return nil
 }
 
 var ethZeroAddress []byte = make([]byte, eth.EthereumTypeAddressDescriptorLen)
@@ -735,7 +876,7 @@ func unpackContractInfo(buf []byte) (*bchain.ContractInfo, error) {
 	ui, l = unpackVaruint(buf)
 	contractInfo.CreatedInBlock = uint32(ui)
 	buf = buf[l:]
-	ui, l = unpackVaruint(buf)
+	ui, _ = unpackVaruint(buf)
 	contractInfo.DestructedInBlock = uint32(ui)
 	return &contractInfo, nil
 }
@@ -765,7 +906,7 @@ func (d *RocksDB) GetContractInfo(contract bchain.AddressDescriptor, typeFromCon
 		if len(buf) == 0 {
 			return nil, nil
 		}
-		contractInfo, err = unpackContractInfo(buf)
+		contractInfo, _ = unpackContractInfo(buf)
 		addresses, _, _ := d.chainParser.GetAddressesFromAddrDesc(contract)
 		if len(addresses) > 0 {
 			contractInfo.Contract = addresses[0]
@@ -774,6 +915,9 @@ func (d *RocksDB) GetContractInfo(contract bchain.AddressDescriptor, typeFromCon
 		if typeFromContext != bchain.UnknownTokenType && contractInfo.Type == bchain.UnknownTokenType {
 			contractInfo.Type = typeFromContext
 			err = d.db.PutCF(d.wo, d.cfh[cfContracts], contract, packContractInfo(contractInfo))
+			if err != nil {
+				return nil, err
+			}
 		}
 		cachedContractsMux.Lock()
 		cachedContracts[cacheKey] = contractInfo
@@ -864,8 +1008,9 @@ func (d *RocksDB) storeAndCleanupBlockTxsEthereumType(wb *grocksdb.WriteBatch, b
 	return d.cleanupBlockTxs(wb, block)
 }
 
-func (d *RocksDB) storeBlockInternalDataErrorEthereumType(wb *grocksdb.WriteBatch, block *bchain.Block, message string) error {
+func (d *RocksDB) StoreBlockInternalDataErrorEthereumType(wb *grocksdb.WriteBatch, block *bchain.Block, message string, retryCount uint8) error {
 	key := packUint(block.Height)
+	// TODO: this supposes that Txid and block hash are the same size
 	txid, err := d.chainParser.PackTxid(block.Hash)
 	if err != nil {
 		return err
@@ -874,10 +1019,58 @@ func (d *RocksDB) storeBlockInternalDataErrorEthereumType(wb *grocksdb.WriteBatc
 	buf := make([]byte, 0, len(txid)+len(m)+1)
 	// the stored structure is txid+retry count (1 byte)+error message
 	buf = append(buf, txid...)
-	buf = append(buf, 0)
+	buf = append(buf, retryCount)
 	buf = append(buf, m...)
 	wb.PutCF(d.cfh[cfBlockInternalDataErrors], key, buf)
 	return nil
+}
+
+type BlockInternalDataError struct {
+	Height       uint32
+	Hash         string
+	Retries      uint8
+	ErrorMessage string
+}
+
+func (d *RocksDB) unpackBlockInternalDataError(val []byte) (string, uint8, string, error) {
+	txidUnpackedLen := d.chainParser.PackedTxidLen()
+	var hash, message string
+	var retries uint8
+	var err error
+	if len(val) > txidUnpackedLen+1 {
+		hash, err = d.chainParser.UnpackTxid(val[:txidUnpackedLen])
+		if err != nil {
+			return "", 0, "", err
+		}
+		val = val[txidUnpackedLen:]
+		retries = val[0]
+		message = string(val[1:])
+	}
+	return hash, retries, message, nil
+}
+
+func (d *RocksDB) GetBlockInternalDataErrorsEthereumType() ([]BlockInternalDataError, error) {
+	retval := []BlockInternalDataError{}
+	if d.chainParser.GetChainType() == bchain.ChainEthereumType {
+		it := d.db.NewIteratorCF(d.ro, d.cfh[cfBlockInternalDataErrors])
+		defer it.Close()
+		for it.SeekToFirst(); it.Valid(); it.Next() {
+			height := unpackUint(it.Key().Data())
+			val := it.Value().Data()
+			hash, retires, message, err := d.unpackBlockInternalDataError(val)
+			if err != nil {
+				glog.Error("GetBlockInternalDataErrorsEthereumType height ", height, ", unpack error ", err)
+				continue
+			}
+			retval = append(retval, BlockInternalDataError{
+				Height:       height,
+				Hash:         hash,
+				Retries:      retires,
+				ErrorMessage: message,
+			})
+		}
+	}
+	return retval, nil
 }
 
 func (d *RocksDB) storeBlockSpecificDataEthereumType(wb *grocksdb.WriteBatch, block *bchain.Block) error {
@@ -885,7 +1078,7 @@ func (d *RocksDB) storeBlockSpecificDataEthereumType(wb *grocksdb.WriteBatch, bl
 	if blockSpecificData != nil {
 		if blockSpecificData.InternalDataError != "" {
 			glog.Info("storeBlockSpecificDataEthereumType ", block.Height, ": ", blockSpecificData.InternalDataError)
-			if err := d.storeBlockInternalDataErrorEthereumType(wb, block, blockSpecificData.InternalDataError); err != nil {
+			if err := d.StoreBlockInternalDataErrorEthereumType(wb, block, blockSpecificData.InternalDataError, 0); err != nil {
 				return err
 			}
 		}
@@ -1201,4 +1394,62 @@ func (d *RocksDB) DisconnectBlockRangeEthereumType(lower uint32, higher uint32) 
 		glog.Infof("rocksdb: blocks %d-%d disconnected", lower, higher)
 	}
 	return err
+}
+
+func (d *RocksDB) SortAddressContracts(stop chan os.Signal) error {
+	if d.chainParser.GetChainType() != bchain.ChainEthereumType {
+		glog.Info("SortAddressContracts: applicable only for ethereum type coins")
+		return nil
+	}
+	glog.Info("SortAddressContracts: starting")
+	// do not use cache
+	ro := grocksdb.NewDefaultReadOptions()
+	ro.SetFillCache(false)
+	it := d.db.NewIteratorCF(ro, d.cfh[cfAddressContracts])
+	defer it.Close()
+	var rowCount, idsSortedCount, multiTokenValuesSortedCount int
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		select {
+		case <-stop:
+			return errors.New("SortAddressContracts: interrupted")
+		default:
+		}
+		rowCount++
+		addrDesc := it.Key().Data()
+		buf := it.Value().Data()
+		if len(buf) > 0 {
+			ca, err := unpackAddrContracts(buf, addrDesc)
+			if err != nil {
+				glog.Error("failed to unpack AddrContracts for: ", hex.EncodeToString(addrDesc))
+			}
+			update := false
+			for i := range ca.Contracts {
+				c := &ca.Contracts[i]
+				if sorted := c.Ids.sort(); sorted {
+					idsSortedCount++
+					update = true
+				}
+				if sorted := c.MultiTokenValues.sort(); sorted {
+					multiTokenValuesSortedCount++
+					update = true
+				}
+			}
+			if update {
+				if err := func() error {
+					wb := grocksdb.NewWriteBatch()
+					defer wb.Destroy()
+					buf := packAddrContracts(ca)
+					wb.PutCF(d.cfh[cfAddressContracts], addrDesc, buf)
+					return d.WriteBatch(wb)
+				}(); err != nil {
+					return errors.Errorf("failed to write cfAddressContracts for: %v: %v", addrDesc, err)
+				}
+			}
+		}
+		if rowCount%5000000 == 0 {
+			glog.Infof("SortAddressContracts: progress - scanned %d rows, sorted %d ids and %d multi token values", rowCount, idsSortedCount, multiTokenValuesSortedCount)
+		}
+	}
+	glog.Infof("SortAddressContracts: finished - scanned %d rows, sorted %d ids and %d multi token value", rowCount, idsSortedCount, multiTokenValuesSortedCount)
+	return nil
 }
