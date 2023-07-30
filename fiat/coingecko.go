@@ -3,9 +3,10 @@ package fiat
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 // Coingecko is a structure that implements RatesDownloaderInterface
 type Coingecko struct {
 	url                 string
+	apiKey              string
 	coin                string
 	platformIdentifier  string
 	platformVsCurrency  string
@@ -30,6 +32,7 @@ type Coingecko struct {
 	db                  *db.RocksDB
 	updatingCurrent     bool
 	updatingTokens      bool
+	metrics             *common.Metrics
 }
 
 // simpleSupportedVSCurrencies https://api.coingecko.com/api/v3/simple/supported_vs_currencies
@@ -51,7 +54,7 @@ type marketChartPrices struct {
 }
 
 // NewCoinGeckoDownloader creates a coingecko structure that implements the RatesDownloaderInterface
-func NewCoinGeckoDownloader(db *db.RocksDB, url string, coin string, platformIdentifier string, platformVsCurrency string, allowedVsCurrencies string, timeFormat string, throttleDown bool) RatesDownloaderInterface {
+func NewCoinGeckoDownloader(db *db.RocksDB, url string, coin string, platformIdentifier string, platformVsCurrency string, allowedVsCurrencies string, timeFormat string, metrics *common.Metrics, throttleDown bool) RatesDownloaderInterface {
 	var throttlingDelayMs int
 	if throttleDown {
 		throttlingDelayMs = 100
@@ -63,8 +66,22 @@ func NewCoinGeckoDownloader(db *db.RocksDB, url string, coin string, platformIde
 			allowedVsCurrenciesMap[c] = struct{}{}
 		}
 	}
+
+	apiKey := os.Getenv("COINGECKO_API_KEY")
+
+	// use default address if not overridden, with respect to existence of apiKey
+	if url == "" {
+		if apiKey != "" {
+			url = "https://pro-api.coingecko.com/api/v3/"
+		} else {
+			url = "https://api.coingecko.com/api/v3"
+		}
+	}
+	glog.Info("Coingecko downloader url ", url)
+
 	return &Coingecko{
 		url:                 url,
+		apiKey:              apiKey,
 		coin:                coin,
 		platformIdentifier:  platformIdentifier,
 		platformVsCurrency:  platformVsCurrency,
@@ -76,6 +93,7 @@ func NewCoinGeckoDownloader(db *db.RocksDB, url string, coin string, platformIde
 		},
 		db:              db,
 		throttlingDelay: time.Duration(throttlingDelayMs) * time.Millisecond,
+		metrics:         metrics,
 	}
 }
 
@@ -86,7 +104,7 @@ func doReq(req *http.Request, client *http.Client) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +115,7 @@ func doReq(req *http.Request, client *http.Client) ([]byte, error) {
 }
 
 // makeReq HTTP request helper - will retry the call after 1 minute on error
-func (cg *Coingecko) makeReq(url string) ([]byte, error) {
+func (cg *Coingecko) makeReq(url string, endpoint string) ([]byte, error) {
 	for {
 		// glog.Infof("Coingecko makeReq %v", url)
 		req, err := http.NewRequest("GET", url, nil)
@@ -105,13 +123,25 @@ func (cg *Coingecko) makeReq(url string) ([]byte, error) {
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if cg.apiKey != "" {
+			req.Header.Set("x-cg-pro-api-key", cg.apiKey)
+		}
 		resp, err := doReq(req, cg.httpClient)
 		if err == nil {
+			if cg.metrics != nil {
+				cg.metrics.CoingeckoRequests.With(common.Labels{"endpoint": endpoint, "status": "success"}).Inc()
+			}
 			return resp, err
 		}
 		if err.Error() != "error code: 1015" && !strings.Contains(strings.ToLower(err.Error()), "exceeded the rate limit") {
+			if cg.metrics != nil {
+				cg.metrics.CoingeckoRequests.With(common.Labels{"endpoint": endpoint, "status": "error"}).Inc()
+			}
 			glog.Errorf("Coingecko makeReq %v error %v", url, err)
 			return nil, err
+		}
+		if cg.metrics != nil {
+			cg.metrics.CoingeckoRequests.With(common.Labels{"endpoint": endpoint, "status": "throttle"}).Inc()
 		}
 		// if there is a throttling error, wait 60 seconds and retry
 		glog.Warningf("Coingecko makeReq %v error %v, will retry in 60 seconds", url, err)
@@ -122,7 +152,7 @@ func (cg *Coingecko) makeReq(url string) ([]byte, error) {
 // SimpleSupportedVSCurrencies /simple/supported_vs_currencies
 func (cg *Coingecko) simpleSupportedVSCurrencies() (simpleSupportedVSCurrencies, error) {
 	url := cg.url + "/simple/supported_vs_currencies"
-	resp, err := cg.makeReq(url)
+	resp, err := cg.makeReq(url, "supported_vs_currencies")
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +183,7 @@ func (cg *Coingecko) simplePrice(ids []string, vsCurrencies []string) (*map[stri
 	params.Add("vs_currencies", vsCurrenciesParam)
 
 	url := fmt.Sprintf("%s/simple/price?%s", cg.url, params.Encode())
-	resp, err := cg.makeReq(url)
+	resp, err := cg.makeReq(url, "simple/price")
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +206,7 @@ func (cg *Coingecko) coinsList() (coinList, error) {
 	}
 	params.Add("include_platform", platform)
 	url := fmt.Sprintf("%s/coins/list?%s", cg.url, params.Encode())
-	resp, err := cg.makeReq(url)
+	resp, err := cg.makeReq(url, "coins/list")
 	if err != nil {
 		return nil, err
 	}
@@ -190,18 +220,20 @@ func (cg *Coingecko) coinsList() (coinList, error) {
 }
 
 // coinMarketChart /coins/{id}/market_chart?vs_currency={usd, eur, jpy, etc.}&days={1,14,30,max}
-func (cg *Coingecko) coinMarketChart(id string, vs_currency string, days string) (*marketChartPrices, error) {
+func (cg *Coingecko) coinMarketChart(id string, vs_currency string, days string, daily bool) (*marketChartPrices, error) {
 	if len(id) == 0 || len(vs_currency) == 0 || len(days) == 0 {
 		return nil, fmt.Errorf("id, vs_currency, and days is required")
 	}
 
 	params := url.Values{}
-	params.Add("interval", "daily")
+	if daily {
+		params.Add("interval", "daily")
+	}
 	params.Add("vs_currency", vs_currency)
 	params.Add("days", days)
 
 	url := fmt.Sprintf("%s/coins/%s/market_chart?%s", cg.url, id, params.Encode())
-	resp, err := cg.makeReq(url)
+	resp, err := cg.makeReq(url, "market_chart")
 	if err != nil {
 		return nil, err
 	}
@@ -241,6 +273,7 @@ func (cg *Coingecko) platformIds() error {
 	return nil
 }
 
+// CurrentTickers returns the latest exchange rates
 func (cg *Coingecko) CurrentTickers() (*common.CurrencyRatesTicker, error) {
 	cg.updatingCurrent = true
 	defer func() { cg.updatingCurrent = false }()
@@ -296,6 +329,45 @@ func (cg *Coingecko) CurrentTickers() (*common.CurrencyRatesTicker, error) {
 	return &newTickers, nil
 }
 
+func (cg *Coingecko) getHighGranularityTickers(days string) (*[]common.CurrencyRatesTicker, error) {
+	mc, err := cg.coinMarketChart(cg.coin, highGranularityVsCurrency, days, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(mc.Prices) < 2 {
+		return nil, nil
+	}
+	// ignore the last point, it is not in granularity
+	tickers := make([]common.CurrencyRatesTicker, len(mc.Prices)-1)
+	for i, p := range mc.Prices[:len(mc.Prices)-1] {
+		var timestamp uint
+		timestamp = uint(p[0])
+		if timestamp > 100000000000 {
+			// convert timestamp from milliseconds to seconds
+			timestamp /= 1000
+		}
+		rate := float32(p[1])
+		u := time.Unix(int64(timestamp), 0).UTC()
+		ticker := common.CurrencyRatesTicker{
+			Timestamp: u,
+			Rates:     make(map[string]float32),
+		}
+		ticker.Rates[highGranularityVsCurrency] = rate
+		tickers[i] = ticker
+	}
+	return &tickers, nil
+}
+
+// HourlyTickers returns the array of the exchange rates in hourly granularity
+func (cg *Coingecko) HourlyTickers() (*[]common.CurrencyRatesTicker, error) {
+	return cg.getHighGranularityTickers("90")
+}
+
+// HourlyTickers returns the array of the exchange rates in five minutes granularity
+func (cg *Coingecko) FiveMinutesTickers() (*[]common.CurrencyRatesTicker, error) {
+	return cg.getHighGranularityTickers("1")
+}
+
 func (cg *Coingecko) getHistoricalTicker(tickersToUpdate map[uint]*common.CurrencyRatesTicker, coinId string, vsCurrency string, token string) (bool, error) {
 	lastTicker, err := cg.db.FiatRatesFindLastTicker(vsCurrency, token)
 	if err != nil {
@@ -312,7 +384,7 @@ func (cg *Coingecko) getHistoricalTicker(tickersToUpdate map[uint]*common.Curren
 		}
 		days = strconv.Itoa(d)
 	}
-	mc, err := cg.coinMarketChart(coinId, vsCurrency, days)
+	mc, err := cg.coinMarketChart(coinId, vsCurrency, days, true)
 	if err != nil {
 		return false, err
 	}

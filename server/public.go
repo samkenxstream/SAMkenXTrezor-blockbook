@@ -25,6 +25,7 @@ import (
 	"github.com/trezor/blockbook/bchain"
 	"github.com/trezor/blockbook/common"
 	"github.com/trezor/blockbook/db"
+	"github.com/trezor/blockbook/fiat"
 )
 
 const txsOnPage = 25
@@ -43,37 +44,39 @@ const (
 // PublicServer provides public http server functionality
 type PublicServer struct {
 	htmlTemplates[TemplateData]
-	binding          string
-	certFiles        string
-	socketio         *SocketIoServer
-	websocket        *WebsocketServer
-	https            *http.Server
-	db               *db.RocksDB
-	txCache          *db.TxCache
-	chain            bchain.BlockChain
-	chainParser      bchain.BlockChainParser
-	mempool          bchain.Mempool
-	api              *api.Worker
-	explorerURL      string
-	internalExplorer bool
-	is               *common.InternalState
+	binding             string
+	certFiles           string
+	socketio            *SocketIoServer
+	websocket           *WebsocketServer
+	https               *http.Server
+	db                  *db.RocksDB
+	txCache             *db.TxCache
+	chain               bchain.BlockChain
+	chainParser         bchain.BlockChainParser
+	mempool             bchain.Mempool
+	api                 *api.Worker
+	explorerURL         string
+	internalExplorer    bool
+	is                  *common.InternalState
+	fiatRates           *fiat.FiatRates
+	useSatsAmountFormat bool
 }
 
 // NewPublicServer creates new public server http interface to blockbook and returns its handle
 // only basic functionality is mapped, to map all functions, call
-func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bchain.BlockChain, mempool bchain.Mempool, txCache *db.TxCache, explorerURL string, metrics *common.Metrics, is *common.InternalState, debugMode bool) (*PublicServer, error) {
+func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bchain.BlockChain, mempool bchain.Mempool, txCache *db.TxCache, explorerURL string, metrics *common.Metrics, is *common.InternalState, fiatRates *fiat.FiatRates, debugMode bool) (*PublicServer, error) {
 
-	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is)
+	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return nil, err
 	}
 
-	socketio, err := NewSocketIoServer(db, chain, mempool, txCache, metrics, is)
+	socketio, err := NewSocketIoServer(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return nil, err
 	}
 
-	websocket, err := NewWebsocketServer(db, chain, mempool, txCache, metrics, is)
+	websocket, err := NewWebsocketServer(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return nil, err
 	}
@@ -90,20 +93,22 @@ func NewPublicServer(binding string, certFiles string, db *db.RocksDB, chain bch
 			metrics: metrics,
 			debug:   debugMode,
 		},
-		binding:          binding,
-		certFiles:        certFiles,
-		https:            https,
-		api:              api,
-		socketio:         socketio,
-		websocket:        websocket,
-		db:               db,
-		txCache:          txCache,
-		chain:            chain,
-		chainParser:      chain.GetChainParser(),
-		mempool:          mempool,
-		explorerURL:      explorerURL,
-		internalExplorer: explorerURL == "",
-		is:               is,
+		binding:             binding,
+		certFiles:           certFiles,
+		https:               https,
+		api:                 api,
+		socketio:            socketio,
+		websocket:           websocket,
+		db:                  db,
+		txCache:             txCache,
+		chain:               chain,
+		chainParser:         chain.GetChainParser(),
+		mempool:             mempool,
+		explorerURL:         explorerURL,
+		internalExplorer:    explorerURL == "",
+		is:                  is,
+		fiatRates:           fiatRates,
+		useSatsAmountFormat: chain.GetChainParser().GetChainType() == bchain.ChainBitcoinType && chain.GetChainParser().AmountDecimals() == 8,
 	}
 	s.htmlTemplates.newTemplateData = s.newTemplateData
 	s.htmlTemplates.newTemplateDataWithError = s.newTemplateDataWithError
@@ -353,7 +358,7 @@ func (s *PublicServer) newTemplateData(r *http.Request) *TemplateData {
 		t.MultiTokenName = bchain.EthereumTokenTypeMap[bchain.MultiToken]
 	}
 	if !s.debug {
-		t.Minified = ".min.2"
+		t.Minified = ".min.3"
 	}
 	if s.is.HasFiatRates {
 		// get the secondary coin and if it should be shown either from query parameters "secondary" and "use_secondary"
@@ -377,10 +382,10 @@ func (s *PublicServer) newTemplateData(r *http.Request) *TemplateData {
 				secondary = "usd"
 			}
 		}
-		ticker := s.is.GetCurrentTicker(secondary, "")
+		ticker := s.fiatRates.GetCurrentTicker(secondary, "")
 		if ticker == nil && secondary != "usd" {
 			secondary = "usd"
-			ticker = s.is.GetCurrentTicker(secondary, "")
+			ticker = s.fiatRates.GetCurrentTicker(secondary, "")
 		}
 		if ticker != nil {
 			t.SecondaryCoin = strings.ToUpper(secondary)
@@ -566,7 +571,11 @@ func (s *PublicServer) amountSpan(a *api.Amount, td *TemplateData, classes strin
 	primary := s.formatAmount(a)
 	var rv strings.Builder
 	appendAmountWrapperSpan(&rv, primary, td.CoinShortcut, classes)
-	appendAmountSpan(&rv, "prim-amt", primary, td.CoinShortcut, "")
+	if s.useSatsAmountFormat {
+		appendAmountSpanBitcoinType(&rv, "prim-amt", primary, td.CoinShortcut, "")
+	} else {
+		appendAmountSpan(&rv, "prim-amt", primary, td.CoinShortcut, "")
+	}
 	if td.SecondaryCoin != "" {
 		p, err := strconv.ParseFloat(primary, 64)
 		if err == nil {
@@ -577,7 +586,11 @@ func (s *PublicServer) amountSpan(a *api.Amount, td *TemplateData, classes strin
 				if td.TxTicker == nil {
 					date := time.Unix(td.Tx.Blocktime, 0).UTC()
 					secondary := strings.ToLower(td.SecondaryCoin)
-					ticker, _ := s.db.FiatRatesFindTicker(&date, secondary, "")
+					var ticker *common.CurrencyRatesTicker
+					tickers, err := s.fiatRates.GetTickersForTimestamps([]int64{int64(td.Tx.Blocktime)}, "", "")
+					if err == nil && tickers != nil && len(*tickers) > 0 {
+						ticker = (*tickers)[0]
+					}
 					if ticker != nil {
 						td.TxSecondaryCoinRate = float64(ticker.Rates[secondary])
 						// the ticker is from the midnight, valid for the whole day before

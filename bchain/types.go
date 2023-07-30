@@ -265,6 +265,11 @@ type XpubDescriptor struct {
 // MempoolTxidEntries is array of MempoolTxidEntry
 type MempoolTxidEntries []MempoolTxidEntry
 
+// MempoolTxidFilterEntries is a map of txids to mempool golomb filters
+type MempoolTxidFilterEntries struct {
+	Entries map[string]string `json:"entries,omitempty"`
+}
+
 // OnNewBlockFunc is used to send notification about a new block
 type OnNewBlockFunc func(hash string, height uint32)
 
@@ -378,4 +383,5 @@ type Mempool interface {
 	GetAddrDescTransactions(addrDesc AddressDescriptor) ([]Outpoint, error)
 	GetAllEntries() MempoolTxidEntries
 	GetTransactionTime(txid string) uint32
+	GetTxidFilterEntries(filterScripts string, fromTimestamp uint32) (MempoolTxidFilterEntries, error)
 }

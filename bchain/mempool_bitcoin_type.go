@@ -1,10 +1,14 @@
 package bchain
 
 import (
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"math/big"
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/martinboehm/btcutil/gcs"
 )
 
 type chanInputPayload struct {
@@ -12,17 +16,34 @@ type chanInputPayload struct {
 	index int
 }
 
+type filterScriptsType int
+
+const (
+	filterScriptsInvalid = filterScriptsType(iota)
+	filterScriptsAll
+	filterScriptsTaproot
+)
+
 // MempoolBitcoinType is mempool handle.
 type MempoolBitcoinType struct {
 	BaseMempool
 	chanTxid            chan string
 	chanAddrIndex       chan txidio
 	AddrDescForOutpoint AddrDescForOutpointFunc
+	golombFilterP       uint8
+	golombFilterM       uint64
+	filterScripts       filterScriptsType
 }
 
 // NewMempoolBitcoinType creates new mempool handler.
 // For now there is no cleanup of sync routines, the expectation is that the mempool is created only once per process
-func NewMempoolBitcoinType(chain BlockChain, workers int, subworkers int) *MempoolBitcoinType {
+func NewMempoolBitcoinType(chain BlockChain, workers int, subworkers int, golombFilterP uint8, filterScripts string) *MempoolBitcoinType {
+	filterScriptsType := filterScriptsToScriptsType(filterScripts)
+	if filterScriptsType == filterScriptsInvalid {
+		glog.Error("Invalid filterScripts ", filterScripts, ", switching off golomb filter")
+		golombFilterP = 0
+	}
+	golombFilterM := uint64(1 << golombFilterP)
 	m := &MempoolBitcoinType{
 		BaseMempool: BaseMempool{
 			chain:        chain,
@@ -31,6 +52,9 @@ func NewMempoolBitcoinType(chain BlockChain, workers int, subworkers int) *Mempo
 		},
 		chanTxid:      make(chan string, 1),
 		chanAddrIndex: make(chan txidio, 1),
+		golombFilterP: golombFilterP,
+		golombFilterM: golombFilterM,
+		filterScripts: filterScriptsType,
 	}
 	for i := 0; i < workers; i++ {
 		go func(i int) {
@@ -45,16 +69,26 @@ func NewMempoolBitcoinType(chain BlockChain, workers int, subworkers int) *Mempo
 				}(j)
 			}
 			for txid := range m.chanTxid {
-				io, ok := m.getTxAddrs(txid, chanInput, chanResult)
+				io, golombFilter, ok := m.getTxAddrs(txid, chanInput, chanResult)
 				if !ok {
 					io = []addrIndex{}
 				}
-				m.chanAddrIndex <- txidio{txid, io}
+				m.chanAddrIndex <- txidio{txid, io, golombFilter}
 			}
 		}(i)
 	}
 	glog.Info("mempool: starting with ", workers, "*", subworkers, " sync workers")
 	return m
+}
+
+func filterScriptsToScriptsType(filterScripts string) filterScriptsType {
+	switch filterScripts {
+	case "":
+		return filterScriptsAll
+	case "taproot":
+		return filterScriptsTaproot
+	}
+	return filterScriptsInvalid
 }
 
 func (m *MempoolBitcoinType) getInputAddress(payload *chanInputPayload) *addrIndex {
@@ -91,11 +125,64 @@ func (m *MempoolBitcoinType) getInputAddress(payload *chanInputPayload) *addrInd
 
 }
 
-func (m *MempoolBitcoinType) getTxAddrs(txid string, chanInput chan chanInputPayload, chanResult chan *addrIndex) ([]addrIndex, bool) {
+func isTaproot(addrDesc AddressDescriptor) bool {
+	if len(addrDesc) == 34 && addrDesc[0] == 0x51 && addrDesc[1] == 0x20 {
+		return true
+	}
+	return false
+}
+
+func (m *MempoolBitcoinType) computeGolombFilter(mtx *MempoolTx) string {
+	uniqueScripts := make(map[string]struct{})
+	filterData := make([][]byte, 0)
+	for i := range mtx.Vin {
+		vin := &mtx.Vin[i]
+		if m.filterScripts == filterScriptsAll || (m.filterScripts == filterScriptsTaproot && isTaproot(vin.AddrDesc)) {
+			s := string(vin.AddrDesc)
+			if _, found := uniqueScripts[s]; !found {
+				filterData = append(filterData, vin.AddrDesc)
+				uniqueScripts[s] = struct{}{}
+			}
+		}
+	}
+	for i := range mtx.Vout {
+		vout := &mtx.Vout[i]
+		b, err := hex.DecodeString(vout.ScriptPubKey.Hex)
+		if err == nil {
+			if m.filterScripts == filterScriptsAll || (m.filterScripts == filterScriptsTaproot && isTaproot(b)) {
+				s := string(b)
+				if _, found := uniqueScripts[s]; !found {
+					filterData = append(filterData, b)
+					uniqueScripts[s] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(filterData) == 0 {
+		return ""
+	}
+	b, _ := hex.DecodeString(mtx.Txid)
+	if len(b) < gcs.KeySize {
+		return ""
+	}
+	filter, err := gcs.BuildGCSFilter(m.golombFilterP, m.golombFilterM, *(*[gcs.KeySize]byte)(b[:gcs.KeySize]), filterData)
+	if err != nil {
+		glog.Error("Cannot create golomb filter for ", mtx.Txid, ", ", err)
+		return ""
+	}
+	fb, err := filter.NBytes()
+	if err != nil {
+		glog.Error("Error getting NBytes from golomb filter for ", mtx.Txid, ", ", err)
+		return ""
+	}
+	return hex.EncodeToString(fb)
+}
+
+func (m *MempoolBitcoinType) getTxAddrs(txid string, chanInput chan chanInputPayload, chanResult chan *addrIndex) ([]addrIndex, string, bool) {
 	tx, err := m.chain.GetTransactionForMempool(txid)
 	if err != nil {
 		glog.Error("cannot get transaction ", txid, ": ", err)
-		return nil, false
+		return nil, "", false
 	}
 	glog.V(2).Info("mempool: gettxaddrs ", txid, ", ", len(tx.Vin), " inputs")
 	mtx := m.txToMempoolTx(tx)
@@ -142,10 +229,14 @@ func (m *MempoolBitcoinType) getTxAddrs(txid string, chanInput chan chanInputPay
 			io = append(io, *ai)
 		}
 	}
+	var golombFilter string
+	if m.golombFilterP > 0 {
+		golombFilter = m.computeGolombFilter(mtx)
+	}
 	if m.OnNewTx != nil {
 		m.OnNewTx(mtx)
 	}
-	return io, true
+	return io, golombFilter, true
 }
 
 // Resync gets mempool transactions and maps outputs to transactions.
@@ -182,7 +273,7 @@ func (m *MempoolBitcoinType) Resync() (int, error) {
 				select {
 				// store as many processed transactions as possible
 				case tio := <-m.chanAddrIndex:
-					onNewEntry(tio.txid, txEntry{tio.io, txTime})
+					onNewEntry(tio.txid, txEntry{tio.io, txTime, tio.filter})
 					dispatched--
 				// send transaction to be processed
 				case m.chanTxid <- txid:
@@ -194,7 +285,7 @@ func (m *MempoolBitcoinType) Resync() (int, error) {
 	}
 	for i := 0; i < dispatched; i++ {
 		tio := <-m.chanAddrIndex
-		onNewEntry(tio.txid, txEntry{tio.io, txTime})
+		onNewEntry(tio.txid, txEntry{tio.io, txTime, tio.filter})
 	}
 
 	for txid, entry := range m.txEntries {
@@ -206,4 +297,20 @@ func (m *MempoolBitcoinType) Resync() (int, error) {
 	}
 	glog.Info("mempool: resync finished in ", time.Since(start), ", ", len(m.txEntries), " transactions in mempool")
 	return len(m.txEntries), nil
+}
+
+// GetTxidFilterEntries returns all mempool entries with golomb filter from
+func (m *MempoolBitcoinType) GetTxidFilterEntries(filterScripts string, fromTimestamp uint32) (MempoolTxidFilterEntries, error) {
+	if m.filterScripts != filterScriptsToScriptsType(filterScripts) {
+		return MempoolTxidFilterEntries{}, errors.New(fmt.Sprint("Unsupported script filter ", filterScripts))
+	}
+	m.mux.Lock()
+	entries := make(map[string]string)
+	for txid, entry := range m.txEntries {
+		if entry.filter != "" && entry.time >= fromTimestamp {
+			entries[txid] = entry.filter
+		}
+	}
+	m.mux.Unlock()
+	return MempoolTxidFilterEntries{entries}, nil
 }

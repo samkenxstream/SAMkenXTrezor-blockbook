@@ -17,22 +17,6 @@ func TestRocksTickers(t *testing.T) {
 	})
 	defer closeAndDestroyRocksDB(t, d)
 
-	// Test valid formats
-	for _, date := range []string{"20190130", "2019013012", "201901301250", "20190130125030"} {
-		_, err := FiatRatesConvertDate(date)
-		if err != nil {
-			t.Errorf("%v", err)
-		}
-	}
-
-	// Test invalid formats
-	for _, date := range []string{"01102019", "10201901", "", "abc", "20190130xxx"} {
-		_, err := FiatRatesConvertDate(date)
-		if err == nil {
-			t.Errorf("Wrongly-formatted date \"%v\" marked as valid!", date)
-		}
-	}
-
 	// Test storing & finding tickers
 	pastKey, _ := time.Parse(FiatRatesTimeFormat, "20190627000000")
 	futureKey, _ := time.Parse(FiatRatesTimeFormat, "20190630000000")
@@ -158,22 +142,6 @@ func TestRocksTickers(t *testing.T) {
 		t.Errorf("Ticker %v found unexpectedly for aud vsCurrency", ticker)
 	}
 
-	ticker = d.is.GetCurrentTicker("", "")
-	if ticker != nil {
-		t.Errorf("FiatRatesGetCurrentTicker %v found unexpectedly", ticker)
-	}
-
-	d.is.SetCurrentTicker(ticker1)
-	ticker = d.is.GetCurrentTicker("", "")
-	if err != nil {
-		t.Errorf("TestRocksTickers err: %+v", err)
-	} else if ticker == nil {
-		t.Errorf("Ticker not found")
-	} else if ticker.Timestamp.Format(FiatRatesTimeFormat) != ticker1.Timestamp.Format(FiatRatesTimeFormat) {
-		t.Errorf("Incorrect ticker found. Expected: %v, found: %+v", ticker1.Timestamp, ticker.Timestamp)
-	}
-
-	d.is.SetCurrentTicker(nil)
 }
 
 func Test_packUnpackCurrencyRatesTicker(t *testing.T) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
@@ -102,6 +101,7 @@ var (
 	metrics                       *common.Metrics
 	syncWorker                    *db.SyncWorker
 	internalState                 *common.InternalState
+	fiatRates                     *fiat.FiatRates
 	callbacksOnNewBlock           []bchain.OnNewBlockFunc
 	callbacksOnNewTxAddr          []bchain.OnNewTxAddrFunc
 	callbacksOnNewTx              []bchain.OnNewTxFunc
@@ -157,7 +157,13 @@ func mainWithExitCode() int {
 		return exitCodeFatal
 	}
 
-	coin, coinShortcut, coinLabel, err := coins.GetCoinNameFromConfig(*configFile)
+	configFileContent, err := os.ReadFile(*configFile)
+	if err != nil {
+		glog.Errorf("Error reading file %v, %v", configFile, err)
+		return exitCodeFatal
+	}
+
+	coin, coinShortcut, coinLabel, err := coins.GetCoinNameFromConfig(configFileContent)
 	if err != nil {
 		glog.Error("config: ", err)
 		return exitCodeFatal
@@ -273,6 +279,11 @@ func mainWithExitCode() int {
 		return exitCodeFatal
 	}
 
+	if fiatRates, err = fiat.NewFiatRates(index, configFileContent, metrics, onNewFiatRatesTicker); err != nil {
+		glog.Error("fiatRates ", err)
+		return exitCodeFatal
+	}
+
 	// report BlockbookAppInfo metric, only log possible error
 	if err = blockbookAppInfoMetric(index, chain, txCache, internalState, metrics); err != nil {
 		glog.Error("blockbookAppInfoMetric ", err)
@@ -357,7 +368,7 @@ func mainWithExitCode() int {
 
 	if internalServer != nil || publicServer != nil || chain != nil {
 		// start fiat rates downloader only if not shutting down immediately
-		initDownloaders(index, chain, *configFile)
+		initDownloaders(index, chain, configFileContent)
 		waitForSignalAndShutdown(internalServer, publicServer, chain, 10*time.Second)
 	}
 
@@ -397,7 +408,7 @@ func getBlockChainWithRetry(coin string, configFile string, pushHandler func(bch
 }
 
 func startInternalServer() (*server.InternalServer, error) {
-	internalServer, err := server.NewInternalServer(*internalBinding, *certFiles, index, chain, mempool, txCache, metrics, internalState)
+	internalServer, err := server.NewInternalServer(*internalBinding, *certFiles, index, chain, mempool, txCache, metrics, internalState, fiatRates)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +428,7 @@ func startInternalServer() (*server.InternalServer, error) {
 
 func startPublicServer() (*server.PublicServer, error) {
 	// start public server in limited functionality, extend it after sync is finished by calling ConnectFullPublicInterface
-	publicServer, err := server.NewPublicServer(*publicBinding, *certFiles, index, chain, mempool, txCache, *explorerURL, metrics, internalState, *debugMode)
+	publicServer, err := server.NewPublicServer(*publicBinding, *certFiles, index, chain, mempool, txCache, *explorerURL, metrics, internalState, fiatRates, *debugMode)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +474,7 @@ func performRollback() error {
 }
 
 func blockbookAppInfoMetric(db *db.RocksDB, chain bchain.BlockChain, txCache *db.TxCache, is *common.InternalState, metrics *common.Metrics) error {
-	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is)
+	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return err
 	}
@@ -682,7 +693,7 @@ func waitForSignalAndShutdown(internal *server.InternalServer, public *server.Pu
 func computeFeeStats(stopCompute chan os.Signal, blockFrom, blockTo int, db *db.RocksDB, chain bchain.BlockChain, txCache *db.TxCache, is *common.InternalState, metrics *common.Metrics) error {
 	start := time.Now()
 	glog.Info("computeFeeStats start")
-	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is)
+	api, err := api.NewWorker(db, chain, mempool, txCache, metrics, is, fiatRates)
 	if err != nil {
 		return err
 	}
@@ -691,36 +702,19 @@ func computeFeeStats(stopCompute chan os.Signal, blockFrom, blockTo int, db *db.
 	return err
 }
 
-func initDownloaders(db *db.RocksDB, chain bchain.BlockChain, configFile string) {
-	data, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		glog.Errorf("Error reading file %v, %v", configFile, err)
-		return
+func initDownloaders(db *db.RocksDB, chain bchain.BlockChain, configFileContent []byte) {
+	if fiatRates.Enabled {
+		go fiatRates.RunDownloader()
 	}
 
 	var config struct {
-		FiatRates             string `json:"fiat_rates"`
-		FiatRatesParams       string `json:"fiat_rates_params"`
-		FiatRatesVsCurrencies string `json:"fiat_rates_vs_currencies"`
-		FourByteSignatures    string `json:"fourByteSignatures"`
+		FourByteSignatures string `json:"fourByteSignatures"`
 	}
 
-	err = json.Unmarshal(data, &config)
+	err := json.Unmarshal(configFileContent, &config)
 	if err != nil {
-		glog.Errorf("Error parsing config file %v, %v", configFile, err)
+		glog.Errorf("Error parsing config file %v, %v", *configFile, err)
 		return
-	}
-
-	if config.FiatRates == "" || config.FiatRatesParams == "" {
-		glog.Infof("FiatRates config (%v) is empty, not downloading fiat rates", configFile)
-	} else {
-		fiatRates, err := fiat.NewFiatRatesDownloader(db, config.FiatRates, config.FiatRatesParams, config.FiatRatesVsCurrencies, onNewFiatRatesTicker)
-		if err != nil {
-			glog.Errorf("NewFiatRatesDownloader Init error: %v", err)
-		} else {
-			glog.Infof("Starting %v FiatRates downloader...", config.FiatRates)
-			go fiatRates.Run()
-		}
 	}
 
 	if config.FourByteSignatures != "" && chain.GetChainParser().GetChainType() == bchain.ChainEthereumType {
